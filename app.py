@@ -3,9 +3,15 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import time
 from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+from threading import Lock, Event
 import queue
 import os
+import tkinter as tk
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+import threading
+import sys
+from io import StringIO
+import shutil
 
 
 # ============================================================================
@@ -33,14 +39,53 @@ class Config:
         if not self.url.startswith(('http://', 'https://')):
             self.url = 'https://' + self.url
         
-        max_pages = input("📊 Max stron (Enter = 1000): ").strip()
-        self.max_pages = int(max_pages) if max_pages else 1000
+        # Max stron - minimum 1
+        while True:
+            max_pages = input("📊 Max stron (Enter = 1000, min: 1): ").strip()
+            if not max_pages:
+                self.max_pages = 1000
+                break
+            try:
+                self.max_pages = int(max_pages)
+                if self.max_pages < 1:
+                    print("⚠️  Minimalna liczba stron to 1!")
+                    continue
+                break
+            except ValueError:
+                print("⚠️  Podaj poprawną liczbę!")
         
-        max_workers = input("🔧 Wątków (Enter = 10): ").strip()
-        self.max_workers = int(max_workers) if max_workers else 10
+        # Wątki - minimum 1, maksimum 50
+        while True:
+            max_workers = input("🔧 Wątków (Enter = 10, min: 1, max: 50): ").strip()
+            if not max_workers:
+                self.max_workers = 10
+                break
+            try:
+                self.max_workers = int(max_workers)
+                if self.max_workers < 1:
+                    print("⚠️  Minimalna liczba wątków to 1!")
+                    continue
+                if self.max_workers > 50:
+                    print("⚠️  Maksymalna liczba wątków to 50!")
+                    continue
+                break
+            except ValueError:
+                print("⚠️  Podaj poprawną liczbę!")
         
-        delay = input("⏱️  Opóźnienie między requestami w sekundach (Enter = 0.3): ").strip()
-        self.delay = float(delay) if delay else 0.3
+        # Opóźnienie - minimum 0.3
+        while True:
+            delay = input("⏱️  Opóźnienie między requestami w sekundach (Enter = 0.3, min: 0.3): ").strip()
+            if not delay:
+                self.delay = 0.3
+                break
+            try:
+                self.delay = float(delay)
+                if self.delay < 0.3:
+                    print("⚠️  Minimalne opóźnienie to 0.3s!")
+                    continue
+                break
+            except ValueError:
+                print("⚠️  Podaj poprawną liczbę!")
     
     def print_info(self, allowed_domains):
         """Wyświetla informacje o konfiguracji"""
@@ -305,15 +350,20 @@ class CrawlerStats:
 class PageFetcher:
     """Pobiera strony HTTP"""
     
-    def __init__(self, config):
+    def __init__(self, config, stop_event=None):
         self.config = config
+        self.stop_event = stop_event
     
     def fetch(self, url):
         """
         Pobiera stronę
         Zwraca: (status, html_lub_błąd)
-        status: 'ok', 'error', 'not_html'
+        status: 'ok', 'error', 'not_html', 'stopped'
         """
+        # Sprawdź czy należy przerwać
+        if self.stop_event and self.stop_event.is_set():
+            return 'stopped', 'Przerwano przez użytkownika'
+        
         time.sleep(self.config.delay)
         
         try:
@@ -337,11 +387,12 @@ class PageFetcher:
 class WebCrawler:
     """Główna klasa crawlera"""
     
-    def __init__(self, config):
+    def __init__(self, config, stop_event=None):
         self.config = config
+        self.stop_event = stop_event
         self.domain_manager = DomainManager(config.url)
         self.extractor = HTMLExtractor(self.domain_manager)
-        self.fetcher = PageFetcher(config)
+        self.fetcher = PageFetcher(config, stop_event)
         self.file_manager = FileManager()
         self.stats = CrawlerStats()
         
@@ -351,6 +402,10 @@ class WebCrawler:
     
     def process_url(self, url):
         """Przetwarza jeden URL"""
+        # Sprawdź czy należy przerwać
+        if self.stop_event and self.stop_event.is_set():
+            return []
+        
         # Sprawdź czy już odwiedzony
         if not self.stats.mark_visited(url):
             return []
@@ -360,6 +415,9 @@ class WebCrawler:
         
         # Pobierz stronę
         status, content = self.fetcher.fetch(url)
+        
+        if status == 'stopped':
+            return []
         
         if status == 'error':
             self.stats.add_error(f"{url} | {content}")
@@ -410,6 +468,11 @@ class WebCrawler:
                 futures = {}
                 
                 while True:
+                    # Sprawdź czy należy przerwać
+                    if self.stop_event and self.stop_event.is_set():
+                        print("\n⚠️  Przerwano przez użytkownika")
+                        break
+                    
                     visited_count, _, _ = self.stats.get_counts()
                     
                     # Sprawdź limit
@@ -584,10 +647,382 @@ class TextDeduplicator:
 
 
 # ============================================================================
+# KLASA: PRZEKIEROWANIE KONSOLI
+# ============================================================================
+class ConsoleRedirector:
+    """Przekierowuje print() do GUI"""
+    
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+        self.buffer = StringIO()
+    
+    def write(self, text):
+        try:
+            self.text_widget.insert(tk.END, text)
+            self.text_widget.see(tk.END)
+            self.text_widget.update_idletasks()
+        except:
+            pass  # Ignoruj błędy przy zamykaniu
+    
+    def flush(self):
+        pass
+
+
+# ============================================================================
+# KLASA: GŁÓWNE OKNO GUI
+# ============================================================================
+class CrawlerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🕷️ Web Crawler + Ekstraktor")
+        self.root.geometry("900x850")
+        self.root.configure(bg="#f0f0f0")
+        
+        self.is_running = False
+        self.crawler = None
+        self.stop_event = Event()
+        self.stats_update_job = None
+        
+        self._create_widgets()
+    
+    def _create_widgets(self):
+        """Tworzy wszystkie elementy GUI"""
+        
+        # === SEKCJA 1: INPUT URL ===
+        frame_url = tk.Frame(self.root, bg="#f0f0f0", padx=10, pady=10)
+        frame_url.pack(fill=tk.X)
+        
+        tk.Label(frame_url, text="📍 URL Strony:", font=("Arial", 12, "bold"), 
+                bg="#f0f0f0").pack(anchor=tk.W)
+        
+        self.url_entry = tk.Entry(frame_url, font=("Arial", 11), width=80)
+        self.url_entry.pack(fill=tk.X, pady=5)
+        self.url_entry.insert(0, "https://example.com")
+        
+        # === SEKCJA 2: PARAMETRY ===
+        frame_params = tk.LabelFrame(self.root, text="⚙️ Parametry", font=("Arial", 11, "bold"),
+                                     bg="#f0f0f0", padx=10, pady=10)
+        frame_params.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Max stron
+        row1 = tk.Frame(frame_params, bg="#f0f0f0")
+        row1.pack(fill=tk.X, pady=3)
+        tk.Label(row1, text="📊 Max stron:", width=15, anchor=tk.W, bg="#f0f0f0").pack(side=tk.LEFT)
+        self.max_pages = tk.Spinbox(row1, from_=1, to=100000, width=15, font=("Arial", 10))
+        self.max_pages.delete(0, tk.END)
+        self.max_pages.insert(0, "1000")
+        self.max_pages.pack(side=tk.LEFT, padx=5)
+        tk.Label(row1, text="(min: 1)", font=("Arial", 9), fg="#666", bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        
+        # Wątki
+        row2 = tk.Frame(frame_params, bg="#f0f0f0")
+        row2.pack(fill=tk.X, pady=3)
+        tk.Label(row2, text="🔧 Liczba wątków:", width=15, anchor=tk.W, bg="#f0f0f0").pack(side=tk.LEFT)
+        self.max_workers = tk.Spinbox(row2, from_=1, to=50, width=15, font=("Arial", 10))
+        self.max_workers.delete(0, tk.END)
+        self.max_workers.insert(0, "10")
+        self.max_workers.pack(side=tk.LEFT, padx=5)
+        tk.Label(row2, text="(min: 1, max: 50)", font=("Arial", 9), fg="#666", bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        
+        # Opóźnienie
+        row3 = tk.Frame(frame_params, bg="#f0f0f0")
+        row3.pack(fill=tk.X, pady=3)
+        tk.Label(row3, text="⏱️ Opóźnienie (s):", width=15, anchor=tk.W, bg="#f0f0f0").pack(side=tk.LEFT)
+        self.delay = tk.Spinbox(row3, from_=0.3, to=10.0, increment=0.1, width=15, 
+                               font=("Arial", 10), format="%.1f")
+        self.delay.delete(0, tk.END)
+        self.delay.insert(0, "0.3")
+        self.delay.pack(side=tk.LEFT, padx=5)
+        tk.Label(row3, text="(min: 0.3)", font=("Arial", 9), fg="#666", bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        
+        # === SEKCJA 3: PRZYCISKI START/STOP ===
+        frame_button = tk.Frame(self.root, bg="#f0f0f0", pady=10)
+        frame_button.pack(fill=tk.X)
+        
+        self.start_button = tk.Button(frame_button, text="🚀 SCRAPUJ", font=("Arial", 14, "bold"),
+                                      bg="#4CAF50", fg="white", command=self.start_crawling,
+                                      cursor="hand2", padx=30, pady=10)
+        self.start_button.pack(side=tk.LEFT, padx=(250, 10))
+        
+        self.stop_button = tk.Button(frame_button, text="⛔ PRZERWIJ", font=("Arial", 14, "bold"),
+                                     bg="#F44336", fg="white", command=self.stop_crawling,
+                                     cursor="hand2", padx=30, pady=10, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=10)
+        
+        # === SEKCJA 4: STATYSTYKI ===
+        frame_stats = tk.LabelFrame(self.root, text="📊 Statystyki Live", font=("Arial", 11, "bold"),
+                                    bg="#f0f0f0", padx=10, pady=10)
+        frame_stats.pack(fill=tk.X, padx=10, pady=5)
+        
+        stats_grid = tk.Frame(frame_stats, bg="#f0f0f0")
+        stats_grid.pack(fill=tk.X)
+        
+        # Etykiety statystyk
+        tk.Label(stats_grid, text="✅ Przetworzone:", width=18, anchor=tk.W, 
+                bg="#f0f0f0", font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.stat_visited = tk.Label(stats_grid, text="0", width=12, anchor=tk.W,
+                                     font=("Arial", 10, "bold"), fg="#2196F3", bg="#f0f0f0")
+        self.stat_visited.grid(row=0, column=1, sticky=tk.W)
+        
+        tk.Label(stats_grid, text="🔗 Znalezione linki:", width=18, anchor=tk.W,
+                bg="#f0f0f0", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.stat_links = tk.Label(stats_grid, text="0", width=12, anchor=tk.W,
+                                   font=("Arial", 10, "bold"), fg="#FF9800", bg="#f0f0f0")
+        self.stat_links.grid(row=1, column=1, sticky=tk.W)
+        
+        tk.Label(stats_grid, text="❌ Błędy:", width=18, anchor=tk.W,
+                bg="#f0f0f0", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.stat_errors = tk.Label(stats_grid, text="0", width=12, anchor=tk.W,
+                                    font=("Arial", 10, "bold"), fg="#F44336", bg="#f0f0f0")
+        self.stat_errors.grid(row=2, column=1, sticky=tk.W)
+        
+        tk.Label(stats_grid, text="⏱️ Czas:", width=18, anchor=tk.W,
+                bg="#f0f0f0", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.stat_time = tk.Label(stats_grid, text="0.0s", width=12, anchor=tk.W,
+                                  font=("Arial", 10, "bold"), fg="#9C27B0", bg="#f0f0f0")
+        self.stat_time.grid(row=3, column=1, sticky=tk.W)
+        
+        # Progress bar
+        self.progress = ttk.Progressbar(frame_stats, mode='indeterminate')
+        self.progress.pack(fill=tk.X, pady=5)
+        
+        # === SEKCJA 5: KONSOLA ===
+        frame_console = tk.LabelFrame(self.root, text="📋 Logi", font=("Arial", 11, "bold"),
+                                      bg="#f0f0f0", padx=10, pady=10)
+        frame_console.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        self.console = scrolledtext.ScrolledText(frame_console, height=15, font=("Consolas", 9),
+                                                 bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
+        self.console.pack(fill=tk.BOTH, expand=True)
+        
+        # === SEKCJA 6: PRZYCISKI POBIERANIA ===
+        frame_download = tk.Frame(self.root, bg="#f0f0f0", pady=10)
+        frame_download.pack(fill=tk.X, padx=10)
+        
+        self.btn_download_texts = tk.Button(frame_download, text="📥 Pobierz Teksty", 
+                                           font=("Arial", 11, "bold"), bg="#2196F3", fg="white",
+                                           command=self.download_texts, cursor="hand2", 
+                                           padx=20, pady=8, state=tk.DISABLED)
+        self.btn_download_texts.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        
+        self.btn_download_errors = tk.Button(frame_download, text="⚠️ Pobierz Errory",
+                                            font=("Arial", 11, "bold"), bg="#FF5722", fg="white",
+                                            command=self.download_errors, cursor="hand2",
+                                            padx=20, pady=8, state=tk.DISABLED)
+        self.btn_download_errors.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+    
+    def _validate_inputs(self):
+        """Waliduje dane wejściowe"""
+        # Walidacja URL
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showerror("Błąd", "Podaj URL!")
+            return False
+        
+        # Walidacja max_pages
+        try:
+            max_pages = int(self.max_pages.get())
+            if max_pages < 1:
+                messagebox.showerror("Błąd", "Minimalna liczba stron to 1!")
+                return False
+        except ValueError:
+            messagebox.showerror("Błąd", "Liczba stron musi być liczbą całkowitą!")
+            return False
+        
+        # Walidacja max_workers
+        try:
+            max_workers = int(self.max_workers.get())
+            if max_workers < 1:
+                messagebox.showerror("Błąd", "Minimalna liczba wątków to 1!")
+                return False
+            if max_workers > 50:
+                messagebox.showerror("Błąd", "Maksymalna liczba wątków to 50!")
+                return False
+        except ValueError:
+            messagebox.showerror("Błąd", "Liczba wątków musi być liczbą całkowitą!")
+            return False
+        
+        # Walidacja delay
+        try:
+            delay = float(self.delay.get())
+            if delay < 0.3:
+                messagebox.showerror("Błąd", "Minimalne opóźnienie to 0.3s!")
+                return False
+        except ValueError:
+            messagebox.showerror("Błąd", "Opóźnienie musi być liczbą!")
+            return False
+        
+        return True
+    
+    def start_crawling(self):
+        """Rozpoczyna crawling w osobnym wątku"""
+        if self.is_running:
+            messagebox.showwarning("Ostrzeżenie", "Crawling już trwa!")
+            return
+        
+        # Walidacja
+        if not self._validate_inputs():
+            return
+        
+        # Zresetuj Event
+        self.stop_event.clear()
+        
+        # Zablokuj/odblokuj przyciski
+        self.start_button.config(state=tk.DISABLED, bg="#cccccc")
+        self.stop_button.config(state=tk.NORMAL, bg="#F44336")
+        self.btn_download_texts.config(state=tk.DISABLED)
+        self.btn_download_errors.config(state=tk.DISABLED)
+        self.progress.start()
+        
+        # Wyczyść konsolę
+        self.console.delete(1.0, tk.END)
+        
+        # Zresetuj statystyki
+        self.stat_visited.config(text="0")
+        self.stat_links.config(text="0")
+        self.stat_errors.config(text="0")
+        self.stat_time.config(text="0.0s")
+        
+        # Przekieruj print do konsoli GUI
+        sys.stdout = ConsoleRedirector(self.console)
+        
+        # Uruchom w wątku
+        self.is_running = True
+        thread = threading.Thread(target=self._run_crawler, daemon=True)
+        thread.start()
+        
+        # Rozpocznij aktualizację statystyk
+        self._schedule_stats_update()
+    
+    def stop_crawling(self):
+        """Przerywa crawling"""
+        if self.is_running:
+            self.stop_event.set()
+            self.stop_button.config(state=tk.DISABLED, bg="#cccccc")
+            print("\n⚠️  Żądanie przerwania... Proszę czekać...")
+    
+    def _run_crawler(self):
+        """Uruchamia crawler (w osobnym wątku)"""
+        try:
+            # Utwórz konfigurację
+            config = Config()
+            config.url = self.url_entry.get().strip()
+            if not config.url.startswith(('http://', 'https://')):
+                config.url = 'https://' + config.url
+            
+            config.max_pages = int(self.max_pages.get())
+            config.max_workers = int(self.max_workers.get())
+            config.delay = float(self.delay.get())
+            
+            # Uruchom crawler
+            self.crawler = WebCrawler(config, self.stop_event)
+            self.crawler.run()
+            
+            # Deduplikacja (tylko jeśli nie przerwano)
+            if not self.stop_event.is_set():
+                deduplicator = TextDeduplicator()
+                deduplicator.deduplicate()
+            
+            # Odblokuj przyciski pobierania
+            self.root.after(0, lambda: self.btn_download_texts.config(state=tk.NORMAL))
+            if os.path.exists("error_links.txt"):
+                self.root.after(0, lambda: self.btn_download_errors.config(state=tk.NORMAL))
+            
+        except Exception as e:
+            error_msg = f"Błąd podczas crawlingu:\n{e}"
+            self.root.after(0, lambda: messagebox.showerror("Błąd", error_msg))
+            print(f"\n❌ {error_msg}")
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL, bg="#4CAF50"))
+            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED, bg="#cccccc"))
+            self.root.after(0, self.progress.stop)
+            # Jedna ostatnia aktualizacja statystyk
+            self.root.after(100, self._final_stats_update)
+    
+    def _schedule_stats_update(self):
+        """Planuje aktualizację statystyk"""
+        if self.is_running:
+            self._update_stats()
+            # Zaplanuj kolejną aktualizację za 300ms
+            self.stats_update_job = self.root.after(300, self._schedule_stats_update)
+    
+    def _update_stats(self):
+        """Aktualizuje statystyki"""
+        if self.crawler:
+            try:
+                visited, links, errors = self.crawler.stats.get_counts()
+                elapsed = self.crawler.stats.get_elapsed_time()
+                
+                self.stat_visited.config(text=str(visited))
+                self.stat_links.config(text=str(links))
+                self.stat_errors.config(text=str(errors))
+                self.stat_time.config(text=f"{elapsed:.1f}s")
+            except Exception as e:
+                pass  # Ignoruj błędy
+    
+    def _final_stats_update(self):
+        """Końcowa aktualizacja statystyk"""
+        if self.crawler:
+            try:
+                visited, links, errors = self.crawler.stats.get_counts()
+                elapsed = self.crawler.stats.get_elapsed_time()
+                
+                self.stat_visited.config(text=str(visited))
+                self.stat_links.config(text=str(links))
+                self.stat_errors.config(text=str(errors))
+                self.stat_time.config(text=f"{elapsed:.1f}s")
+            except:
+                pass
+    
+    def download_texts(self):
+        """Zapisuje plik tekstów w wybranym miejscu"""
+        source = "teksty_unikalne.txt"
+        if not os.path.exists(source):
+            messagebox.showerror("Błąd", f"Plik {source} nie istnieje!")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            title="Zapisz teksty",
+            defaultextension=".txt",
+            filetypes=[("Pliki tekstowe", "*.txt"), ("Wszystkie pliki", "*.*")],
+            initialfile="teksty_unikalne.txt"
+        )
+        
+        if filename:
+            try:
+                shutil.copy(source, filename)
+                messagebox.showinfo("Sukces", f"Zapisano:\n{filename}")
+            except Exception as e:
+                messagebox.showerror("Błąd", f"Nie można zapisać pliku:\n{e}")
+    
+    def download_errors(self):
+        """Zapisuje plik z błędami w wybranym miejscu"""
+        source = "error_links.txt"
+        if not os.path.exists(source):
+            messagebox.showerror("Błąd", f"Plik {source} nie istnieje!")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            title="Zapisz errory",
+            defaultextension=".txt",
+            filetypes=[("Pliki tekstowe", "*.txt"), ("Wszystkie pliki", "*.*")],
+            initialfile="error_links.txt"
+        )
+        
+        if filename:
+            try:
+                shutil.copy(source, filename)
+                messagebox.showinfo("Sukces", f"Zapisano:\n{filename}")
+            except Exception as e:
+                messagebox.showerror("Błąd", f"Nie można zapisać pliku:\n{e}")
+
+
+# ============================================================================
 # FUNKCJA GŁÓWNA
 # ============================================================================
 def main():
-    """Główna funkcja programu"""
+    """Główna funkcja programu (tryb konsolowy)"""
     total_start = time.time()
     
     # 1. Konfiguracja
@@ -622,8 +1057,19 @@ def main():
     print(f"="*60)
 
 
+def main_gui():
+    """Główna funkcja programu (tryb GUI)"""
+    root = tk.Tk()
+    app = CrawlerGUI(root)
+    root.mainloop()
+
+
 # ============================================================================
 # URUCHOMIENIE
 # ============================================================================
 if __name__ == "__main__":
-    main()
+    # Tryb GUI
+    main_gui()
+    
+    # Jeśli chcesz tryb konsolowy, zamień na:
+    # main()
