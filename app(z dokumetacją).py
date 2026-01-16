@@ -1,5 +1,4 @@
-"""Web Crawler + Ekstraktor Tekstu.
-
+"""
 Projekt implementuje aplikację do automatycznego przeszukiwania zasobów WWW w
 obrębie jednej domeny (web crawling) oraz ekstrakcji treści tekstowej z HTML.
 
